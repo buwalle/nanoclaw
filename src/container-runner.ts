@@ -26,12 +26,19 @@ import {
   stopContainer,
 } from './container-runtime.js';
 import { detectAuthMode } from './credential-proxy.js';
+import { readEnvFile } from './env.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
+
+/** Check if user configured a third-party (open-source) model */
+function isUsingThirdPartyModel(): boolean {
+  const secrets = readEnvFile(['ANTHROPIC_BASE_URL']);
+  return !!secrets.ANTHROPIC_BASE_URL;
+}
 
 export interface ContainerInput {
   prompt: string;
@@ -221,21 +228,38 @@ function buildContainerArgs(
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
 
-  // Route API traffic through the credential proxy (containers never see real secrets)
-  args.push(
-    '-e',
-    `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
-  );
+  // Check if using third-party (open-source) model
+  const thirdPartySecrets = readEnvFile([
+    'ANTHROPIC_BASE_URL',
+    'ANTHROPIC_AUTH_TOKEN',
+    'ANTHROPIC_MODEL',
+  ]);
+  const isThirdParty = !!thirdPartySecrets.ANTHROPIC_BASE_URL;
 
-  // Mirror the host's auth method with a placeholder value.
-  // API key mode: SDK sends x-api-key, proxy replaces with real key.
-  // OAuth mode:   SDK exchanges placeholder token for temp API key,
-  //               proxy injects real OAuth token on that exchange request.
-  const authMode = detectAuthMode();
-  if (authMode === 'api-key') {
-    args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
+  if (isThirdParty) {
+    // Third-party model: pass configuration directly to container (bypass proxy)
+    args.push('-e', `ANTHROPIC_BASE_URL=${thirdPartySecrets.ANTHROPIC_BASE_URL}`);
+    args.push('-e', `ANTHROPIC_AUTH_TOKEN=${thirdPartySecrets.ANTHROPIC_AUTH_TOKEN}`);
+    if (thirdPartySecrets.ANTHROPIC_MODEL) {
+      args.push('-e', `ANTHROPIC_MODEL=${thirdPartySecrets.ANTHROPIC_MODEL}`);
+    }
   } else {
-    args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+    // Route API traffic through the credential proxy (containers never see real secrets)
+    args.push(
+      '-e',
+      `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
+    );
+
+    // Mirror the host's auth method with a placeholder value.
+    // API key mode: SDK sends x-api-key, proxy replaces with real key.
+    // OAuth mode:   SDK exchanges placeholder token for temp API key,
+    //               proxy injects real OAuth token on that exchange request.
+    const authMode = detectAuthMode();
+    if (authMode === 'api-key') {
+      args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
+    } else {
+      args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+    }
   }
 
   // Runtime-specific args for host gateway resolution
